@@ -37,4 +37,5 @@ em{font-style:normal;font-size:11px;font-weight:600;padding:3px 10px;border-radi
 .page{padding:18px 28px;max-width:820px}.opt{display:flex;gap:10px;padding:9px 0;align-items:center}
 .txt{display:block;width:100%;padding:10px;border:1px solid #cfd9e8;border-radius:6px;margin:12px 0;font:inherit}
 .file .btn{padding:6px 12px;font-size:12px}nav a:hover{background:#eef4ff}
-.btn.stop{background:#dc2626} 
+.btn.stop{background:#dc2626}
+.grp{margin-top:16px;background:#eff6ff;border-color:#dbe7f7}.grp p{margin:8px 0 0}

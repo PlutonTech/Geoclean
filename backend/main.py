@@ -1,4 +1,5 @@
 import json, os, re, shutil, tempfile, uuid, zipfile
+import numpy as np, shapely
 import geopandas as gpd, pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,7 +13,7 @@ TYPES = {".shp": "Shapefile", ".geojson": "GeoJSON", ".json": "GeoJSON", ".csv":
 ISSUES = [("invalid", "Invalid geometries", "High"), ("dup_features", "Duplicate features", "Medium"),
           ("missing", "Missing coordinates", "Medium"), ("crs", "CRS conflicts", "Low"),
           ("dup_attrs", "Duplicate attributes", "Low"), ("overlaps", "Overlapping polygons", "Medium"),
-          ("nulls", "Null attributes", "Low")]
+          ("nulls", "Null attributes", "Low"), ("cross_dups", "Cross-file duplicates", "Medium")]
 
 
 def read(path):
@@ -66,6 +67,16 @@ def preview(g):
     return json.loads(g.to_json())
 
 
+def sig(g):
+    """Set of normalised geometry hashes (EPSG:4326, ~1 m grid) used to match layers across files."""
+    c = g.crs or guess_crs(g)
+    geo = g.geometry[g.geometry.notna() & ~g.geometry.is_empty]
+    if not c or geo.empty:
+        return None
+    geo = geo.set_crs(c, allow_override=True).to_crs(4326)
+    return set(shapely.to_wkb(shapely.normalize(shapely.set_precision(geo.to_numpy(), 1e-5, mode="pointwise"))))
+
+
 def job(jid):
     if jid not in JOBS:
         raise HTTPException(404, "Unknown job")
@@ -104,8 +115,35 @@ async def analyze(files: list[UploadFile] = File(...)):
     crs = {n: (g.crs.to_epsg() if g.crs else guess_crs(g)) for n, g in layers.items()}
     common = max(set(crs.values()), key=list(crs.values()).count)
     tot["crs"] = sum(1 for n, g in layers.items() if g.crs is None or crs[n] != common)
+    sigs = {}
+    for nm, g in layers.items():
+        try:
+            sigs[nm] = sig(g)
+        except Exception:
+            sigs[nm] = None
+    names = [x for x in sigs if sigs[x]]
+    parent = {x: x for x in names}
+
+    def find(x):
+        while parent[x] != x:
+            x = parent[x]
+        return x
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            if len(sigs[a] & sigs[b]) / min(len(sigs[a]), len(sigs[b])) >= 0.8:
+                parent[find(b)] = find(a)
+    gm = {}
+    for x in names:
+        gm.setdefault(find(x), []).append(x)
+    groups = []
+    for ms in gm.values():
+        if len(ms) > 1:
+            dups = sum(len(sigs[x]) for x in ms) - len(set().union(*(sigs[x] for x in ms)))
+            groups.append({"layers": ms, "duplicates": dups})
+    tot["cross_dups"] = sum(x["duplicates"] for x in groups)
+    JOBS[jid]["groups"] = groups
     n = max(tot["features"], 1)
-    W = {"invalid": 25, "missing": 15, "dup_features": 10, "overlaps": 15, "dup_attrs": 5}
+    W = {"invalid": 25, "missing": 15, "dup_features": 10, "overlaps": 15, "dup_attrs": 5, "cross_dups": 10}
     pen = sum(w * min(1, 10 * tot[k] / n) for k, w in W.items())
     pen += 15 * min(1, tot["crs"] / len(layers)) + 5 * min(1, tot["nulls"] / (n * 3))
     prev = []
@@ -117,17 +155,18 @@ async def analyze(files: list[UploadFile] = File(...)):
         except Exception:
             pass
     return {"job_id": jid, "files": entries, "preview": prev,
-            "report": {"score": max(0, round(100 - pen)), "layers": len(layers),
+            "report": {"score": max(0, round(100 - pen)), "layers": len(layers), "groups": groups,
                        "issues": [{"key": k, "label": l, "severity": s, "found": tot[k]} for k, l, s in ISSUES]}}
 
 
 @app.post("/api/clean/{jid}")
 def clean(jid: str, opts: dict | None = None):
     j = job(jid)
-    o = {"geometry": True, "duplicates": True, "crs": True, "fields": True, **(opts or {})}
+    o = {"geometry": True, "duplicates": True, "crs": True, "fields": True, "merge": True, **(opts or {})}
     out, log, rin, rout = os.path.join(j["dir"], "geoclean_output.gpkg"), [], 0, 0
     if os.path.exists(out):
         os.remove(out)
+    done = {}
     for n, g in j["layers"].items():
         g, rin = g.copy(), rin + len(g)
         if g.crs is None:
@@ -165,7 +204,38 @@ def clean(jid: str, opts: dict | None = None):
             if any(a != b for a, b in ren.items()):
                 g = g.rename(columns=ren)
                 log.append(f"{n}: standardised field names (lowercase, underscores)")
-        g.to_file(out, layer=os.path.splitext(n)[0], driver="GPKG")
+        done[n] = g
+    if o["merge"]:
+        for grp in j.get("groups", []):
+            ms = [x for x in grp["layers"] if x in done]
+            if len({str(done[x].crs) for x in ms}) > 1:
+                log.append(f"Skipped merging {', '.join(ms)}: layers use different CRS (enable reprojection)")
+                continue
+
+            def comp(x):
+                a = done[x].drop(columns=done[x].geometry.name)
+                return 1 - a.isna().to_numpy().mean() if a.size else 1
+            ms.sort(key=comp)  # most complete layer last, so its attributes win
+            parts = [done[x].assign(source_layer=x) for x in ms]
+            m = pd.concat(parts, ignore_index=True)
+            m = gpd.GeoDataFrame(m, geometry=parts[0].geometry.name, crs=parts[0].crs)
+            keys = shapely.to_wkb(shapely.normalize(shapely.set_precision(m.geometry.to_numpy(), 1e-5, mode="pointwise")))
+            idx = np.concatenate([[i] * len(p) for i, p in enumerate(parts)])
+            m2 = m[pd.Series(idx).groupby(keys).transform("max").to_numpy() == idx]
+            base = os.path.commonprefix([os.path.splitext(x)[0] for x in ms]).rstrip("_- .")
+            name = f"{base}_merged" if base else "merged"
+            for x in ms:
+                done.pop(x)
+            done[name + ".gpkg"] = m2
+            log.append(f"Merged {len(ms)} versions of one layer ({', '.join(ms)}) into '{name}': {len(m):,} -> {len(m2):,} features; attributes taken from '{ms[-1]}' (most complete); source_layer column added")
+    used = set()
+    for k, g in done.items():
+        ln, i = os.path.splitext(k)[0], 1
+        while ln in used:
+            i += 1
+            ln = f"{os.path.splitext(k)[0]}_{i}"
+        used.add(ln)
+        g.to_file(out, layer=ln, driver="GPKG")
         rout += len(g)
     log.append("Overlapping polygons, duplicate attributes and null attributes are reported only, not auto-fixed.")
     with open(os.path.join(j["dir"], "changelog.txt"), "w") as f:

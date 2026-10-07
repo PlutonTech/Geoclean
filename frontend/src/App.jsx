@@ -5,7 +5,7 @@ import { Home, PlusCircle, Folder, Settings, UploadCloud, AlertTriangle, CheckCi
 import "./styles.css";
 
 const COLORS = ["#2563eb", "#16a34a", "#9333ea", "#ea580c", "#0d9488", "#dc2626", "#64748b"];
-const DOT = { invalid: "#dc2626", dup_features: "#ea580c", missing: "#f59e0b", crs: "#2563eb", dup_attrs: "#9333ea", overlaps: "#0d9488", nulls: "#64748b" };
+const DOT = { invalid: "#dc2626", dup_features: "#ea580c", missing: "#f59e0b", crs: "#2563eb", dup_attrs: "#9333ea", overlaps: "#0d9488", nulls: "#64748b", cross_dups: "#0ea5e9" };
 const CUR = { idle: 0, analysing: 0, ready: 1, cleaning: 2, done: 4 };
 const STEPS = ["Upload", "Analyse", "Clean", "Download"];
 const mb = (b) => (b / 1048576).toFixed(1) + " MB";
@@ -134,6 +134,11 @@ export default function App() {
                     <div className="tr" key={i.key}><span><u style={{ background: DOT[i.key] }} />{i.label}</span><span>{i.found.toLocaleString()}</span>
                       <span><em className={i.severity}>{i.severity}</em></span></div>))}
                 </div>
+                {report.groups?.length > 0 && (
+                  <div className="note grp"><b><Sparkles size={16} color="#2563eb" /> Versions of the same layer detected</b>
+                    {report.groups.map((g, i) => (
+                      <p key={i}>{g.layers.join(" · ")}: {g.duplicates.toLocaleString()} shared features. {(settings.merge ?? true) ? "Fix Data will merge them into one layer." : "Merging is turned off in Settings."}</p>))}
+                  </div>)}
                 <div className="fix">
                   <Sparkles size={18} color="#2563eb" />
                   <div><b>{phase === "done" ? "Cleaning complete" : "Fix these issues automatically"}</b>
@@ -205,8 +210,8 @@ export default function App() {
             <p className="muted"><small>Downloads work while the backend is running; results are cleared when it restarts.</small></p></div></div>)}
         {view === "settings" && (
           <div className="page"><div className="card"><h2>Settings</h2><h3>Cleaning rules</h3>
-            {[["geometry", "Repair invalid geometries"], ["duplicates", "Remove identical duplicate features"], ["crs", "Reproject to EPSG:4326"], ["fields", "Standardise field names"]].map(([k, l]) => (
-              <label className="opt" key={k}><input type="checkbox" checked={settings[k]} onChange={() => setSettings({ ...settings, [k]: !settings[k] })} />{l}</label>))}
+            {[["geometry", "Repair invalid geometries"], ["duplicates", "Remove identical duplicate features"], ["crs", "Reproject to EPSG:4326"], ["fields", "Standardise field names"], ["merge", "Merge versions of the same layer"]].map(([k, l]) => (
+              <label className="opt" key={k}><input type="checkbox" checked={settings[k] ?? true} onChange={() => setSettings({ ...settings, [k]: !(settings[k] ?? true) })} />{l}</label>))}
             <p className="muted"><small>Applied the next time you click Fix Data.</small></p></div></div>)}
       </main>
     </div>
